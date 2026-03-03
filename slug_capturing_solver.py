@@ -9,6 +9,7 @@ GUI (slug_capturing_gui.py). It manages:
     - Collecting results at probe locations for plotting
     - Detecting slug events (where alpha_L approaches 1.0)
     - Computing slug statistics (frequency, length, translational velocity)
+    - Storing periodic field snapshots for post-run time-history scrubbing
 
 Reference:
     Issa & Kempf (2003), Int. J. Multiphase Flow, 29, 69-95.
@@ -218,10 +219,13 @@ class SlugCapturingSimulation:
     Main simulation class. Runs the 1D two-fluid model time-marching loop.
     """
 
-    def __init__(self, params: SimulationParameters):
+    def __init__(self, params: SimulationParameters,
+                 probe_positions=None, max_snapshots=500):
         self.params = params
         self.mesh = build_mesh(params.segments, params.N_cells)
-        self.probes = ProbeData([0.25, 0.50, 0.75], self.mesh["x_cell"])
+
+        probe_pos = probe_positions if probe_positions is not None else [0.25, 0.50, 0.75]
+        self.probes = ProbeData(probe_pos, self.mesh["x_cell"])
         self.slug_detector = SlugDetector(self.mesh["x_cell"])
 
         # Solution fields (initialized later)
@@ -232,6 +236,10 @@ class SlugCapturingSimulation:
         self.dt = 0.0
         self.step_count = 0
 
+        # Snapshot storage for post-run time-history scrubbing
+        self.snapshots = []
+        self._max_snapshots = max_snapshots
+
         # Threading control
         self._running = False
         self._stop_flag = threading.Event()
@@ -240,6 +248,19 @@ class SlugCapturingSimulation:
         # Callbacks
         self._on_step = None    # called every N steps with (sim,)
         self._on_done = None    # called when simulation finishes
+
+    def _record_snapshot(self):
+        """Store a copy of the current fields for time-history playback."""
+        self.snapshots.append({
+            "t": self.t,
+            "step": self.step_count,
+            "alpha_L": self.alpha_L.copy(),
+            "u_L": self.u_L.copy(),
+            "u_G": self.u_G.copy(),
+        })
+        # Thin by decimation when exceeding budget
+        if len(self.snapshots) > self._max_snapshots:
+            self.snapshots = self.snapshots[::2]
 
     def initialize(self):
         """
@@ -270,6 +291,10 @@ class SlugCapturingSimulation:
 
         self.t = 0.0
         self.step_count = 0
+
+        # Record initial snapshot (t=0)
+        self.snapshots.clear()
+        self._record_snapshot()
 
     def run(self, on_step=None, on_done=None, update_interval=20):
         """
@@ -317,13 +342,17 @@ class SlugCapturingSimulation:
                 if self.step_count % 5 == 0:
                     self.probes.record(self.t, self.alpha_L, self.u_L, self.u_G)
 
-                # Detect slugs periodically
+                # Detect slugs and record snapshots periodically
                 if self.step_count % 10 == 0:
                     self.slug_detector.detect(self.t, self.alpha_L)
+                    self._record_snapshot()
 
                 # GUI update callback
                 if self._on_step and self.step_count % update_interval == 0:
                     self._on_step(self)
+
+            # Record final snapshot so last state is always available
+            self._record_snapshot()
 
             self._running = False
             if self._on_done:
