@@ -44,6 +44,7 @@ class SimulationParameters:
         N_cells=500,       # total number of grid cells
         CFL=0.45,          # CFL number
         t_end=30.0,        # simulation end time (s)
+        convergence_tol=1e-6,  # steady-state convergence tolerance
     ):
         self.segments = segments
         self.D = D
@@ -56,6 +57,7 @@ class SimulationParameters:
         self.N_cells = N_cells
         self.CFL = CFL
         self.t_end = t_end
+        self.convergence_tol = convergence_tol
         self._validate()
 
     def _validate(self):
@@ -236,6 +238,19 @@ class SlugCapturingSimulation:
         self.dt = 0.0
         self.step_count = 0
 
+        # Residual tracking for convergence monitoring
+        self.residual_alpha = 0.0   # max |Δα_L| / Δt  (current step)
+        self.residual_uL = 0.0     # max |Δu_L| / Δt
+        self.residual_uG = 0.0     # max |Δu_G| / Δt
+        self.residual_history = {   # time-series for plotting
+            "time": [],
+            "step": [],
+            "alpha": [],
+            "u_L": [],
+            "u_G": [],
+        }
+        self.converged = False      # True if steady-state reached
+
         # Snapshot storage for post-run time-history scrubbing
         self.snapshots = []
         self._max_snapshots = max_snapshots
@@ -317,7 +332,11 @@ class SlugCapturingSimulation:
         def _run_loop():
             p = self.params
             m = self.mesh
-            record_interval = max(1, int(0.01 / 1e-5))  # ~every 0.01s
+            conv_tol = p.convergence_tol
+            # Number of consecutive steps below tolerance before declaring converged
+            CONV_WINDOW = 100
+
+            conv_count = 0  # consecutive steps below tolerance
 
             while self.t < p.t_end and not self._stop_flag.is_set():
                 # Adaptive time step (pass alpha_L to ignore slug body cells)
@@ -326,6 +345,11 @@ class SlugCapturingSimulation:
                 )
                 # Don't overshoot end time
                 self.dt = min(self.dt, p.t_end - self.t)
+
+                # Save previous fields for residual calculation
+                alpha_old = self.alpha_L.copy()
+                uL_old = self.u_L.copy()
+                uG_old = self.u_G.copy()
 
                 # Advance one step
                 self.alpha_L, self.u_L, self.u_G = time_step(
@@ -337,6 +361,30 @@ class SlugCapturingSimulation:
 
                 self.t += self.dt
                 self.step_count += 1
+
+                # Compute residuals (max absolute change rate per step)
+                if self.dt > 0:
+                    self.residual_alpha = float(np.max(np.abs(self.alpha_L - alpha_old)) / self.dt)
+                    self.residual_uL = float(np.max(np.abs(self.u_L - uL_old)) / self.dt)
+                    self.residual_uG = float(np.max(np.abs(self.u_G - uG_old)) / self.dt)
+
+                # Record residual history periodically (every 5 steps)
+                if self.step_count % 5 == 0:
+                    self.residual_history["time"].append(self.t)
+                    self.residual_history["step"].append(self.step_count)
+                    self.residual_history["alpha"].append(self.residual_alpha)
+                    self.residual_history["u_L"].append(self.residual_uL)
+                    self.residual_history["u_G"].append(self.residual_uG)
+
+                # Check convergence: all residuals below tolerance
+                max_res = max(self.residual_alpha, self.residual_uL, self.residual_uG)
+                if conv_tol > 0 and max_res < conv_tol:
+                    conv_count += 1
+                    if conv_count >= CONV_WINDOW:
+                        self.converged = True
+                        break
+                else:
+                    conv_count = 0
 
                 # Record probe data periodically
                 if self.step_count % 5 == 0:

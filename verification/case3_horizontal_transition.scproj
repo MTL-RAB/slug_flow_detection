@@ -15,5 +15,6 @@
   "N_cells": 1250,
   "CFL": 0.5,
   "t_end": 80.0,
+  "convergence_tol": 1e-06,
   "probe_pcts": "10, 25, 50, 75, 90"
 }

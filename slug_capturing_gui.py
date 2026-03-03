@@ -57,8 +57,36 @@ DEFAULT_STATE = {
     "N_cells": 500,
     "CFL": 0.45,
     "t_end": 30.0,
+    "convergence_tol": 1e-6,
     "probe_pcts": "25, 50, 75",
 }
+
+
+class _ToolTip:
+    """Lightweight tooltip that appears on hover over a tkinter widget."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self._tw = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, event=None):
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tw = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify="left",
+                         background="#ffffe0", relief="solid", borderwidth=1,
+                         font=("Arial", 9), padx=6, pady=4, wraplength=320)
+        label.pack()
+
+    def _hide(self, event=None):
+        if self._tw:
+            self._tw.destroy()
+            self._tw = None
 
 
 def _deep_copy_state(state):
@@ -396,14 +424,24 @@ class SlugCapturingApp:
 
         diam_frame = ttk.Frame(geo_frame)
         diam_frame.pack(fill="x", pady=(6, 0))
-        ttk.Label(diam_frame, text="Pipe diameter D (m):").pack(side="left")
+        lbl_D = ttk.Label(diam_frame, text="Pipe diameter D (m):")
+        lbl_D.pack(side="left")
         self.var_D = tk.StringVar(value="0.078")
         ttk.Entry(diam_frame, textvariable=self.var_D, width=10, justify="center").pack(side="right")
+        _ToolTip(lbl_D, "Internal pipe diameter in metres.\n"
+                 "Default 0.078 m (78 mm) matches the Imperial College\n"
+                 "WASP facility used by Issa & Kempf (2003).")
 
         # Fluid Properties
         fluid_frame = ttk.LabelFrame(left_inner, text="Fluid Properties", padding=6)
         fluid_frame.pack(fill="x", padx=4, pady=6)
         self.fluid_vars = {}
+        fluid_tips = {
+            "rho_L": "Liquid phase density.\nDefault 998.0 kg/m\u00b3 (water at 20\u00b0C).",
+            "rho_G": "Gas phase density.\nDefault 1.2 kg/m\u00b3 (air at atmospheric pressure).",
+            "mu_L": "Liquid dynamic viscosity.\nDefault 0.001 Pa\u00b7s (water at 20\u00b0C).",
+            "mu_G": "Gas dynamic viscosity.\nDefault 1.8e-5 Pa\u00b7s (air at 20\u00b0C).",
+        }
         for key, label, default in [
             ("rho_L", "Liquid density \u03c1\u2097 (kg/m\u00b3)", "998.0"),
             ("rho_G", "Gas density \u03c1\u1d33 (kg/m\u00b3)", "1.2"),
@@ -412,48 +450,80 @@ class SlugCapturingApp:
         ]:
             row = ttk.Frame(fluid_frame)
             row.pack(fill="x", pady=1)
-            ttk.Label(row, text=label).pack(side="left")
+            lbl = ttk.Label(row, text=label)
+            lbl.pack(side="left")
             var = tk.StringVar(value=default)
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.fluid_vars[key] = var
+            _ToolTip(lbl, fluid_tips[key])
 
         # Flow Conditions
         flow_frame = ttk.LabelFrame(left_inner, text="Flow Conditions", padding=6)
         flow_frame.pack(fill="x", padx=4, pady=2)
         self.flow_vars = {}
+        flow_tips = {
+            "U_sL": "Superficial liquid velocity = Q_L / A_pipe.\n"
+                     "Determines liquid loading. Default 1.0 m/s.",
+            "U_sG": "Superficial gas velocity = Q_G / A_pipe.\n"
+                     "Higher values push toward stratified flow.\nDefault 3.0 m/s.",
+        }
         for key, label, default in [
             ("U_sL", "Superficial liquid vel. U\u209b\u2097 (m/s)", "1.0"),
             ("U_sG", "Superficial gas vel. U\u209b\u1d33 (m/s)", "3.0"),
         ]:
             row = ttk.Frame(flow_frame)
             row.pack(fill="x", pady=1)
-            ttk.Label(row, text=label).pack(side="left")
+            lbl = ttk.Label(row, text=label)
+            lbl.pack(side="left")
             var = tk.StringVar(value=default)
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.flow_vars[key] = var
+            _ToolTip(lbl, flow_tips[key])
 
-        # Numerical Settings
-        num_frame = ttk.LabelFrame(left_inner, text="Numerical Settings", padding=6)
+        # Numerical / Solver Settings
+        num_frame = ttk.LabelFrame(left_inner, text="Solver Settings", padding=6)
         num_frame.pack(fill="x", padx=4, pady=6)
         self.num_vars = {}
+        num_tips = {
+            "N_cells": "Number of finite volume cells along the pipe.\n"
+                       "Higher values improve accuracy but increase runtime.\n"
+                       "Default 500. Paper used 1250 (\u0394x/D \u2248 0.37).",
+            "CFL": "Courant-Friedrichs-Lewy number for adaptive time stepping.\n"
+                   "Must be < 1 for stability. Lower values are more stable\n"
+                   "but slower. Default 0.45. Paper used 0.5.",
+            "t_end": "Maximum simulation time in seconds.\n"
+                     "Simulation may stop earlier if convergence is reached.\n"
+                     "Default 30.0 s.",
+            "convergence_tol": "Steady-state convergence tolerance.\n"
+                               "Simulation stops when max rate-of-change of all\n"
+                               "variables drops below this value for 100 consecutive\n"
+                               "steps. Set to 0 to disable. Default 1e-6.",
+        }
         for key, label, default in [
             ("N_cells", "Number of cells", "500"),
             ("CFL", "Max CFL number", "0.45"),
             ("t_end", "Simulation time (s)", "30.0"),
+            ("convergence_tol", "Convergence tol.", "1e-6"),
         ]:
             row = ttk.Frame(num_frame)
             row.pack(fill="x", pady=1)
-            ttk.Label(row, text=label).pack(side="left")
+            lbl = ttk.Label(row, text=label)
+            lbl.pack(side="left")
             var = tk.StringVar(value=default)
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.num_vars[key] = var
+            _ToolTip(lbl, num_tips[key])
 
         # Probe locations
         probe_row = ttk.Frame(num_frame)
         probe_row.pack(fill="x", pady=1)
-        ttk.Label(probe_row, text="Probe locations (%)").pack(side="left")
+        lbl_probe = ttk.Label(probe_row, text="Probe locations (%)")
+        lbl_probe.pack(side="left")
         self.var_probes = tk.StringVar(value="25, 50, 75")
         ttk.Entry(probe_row, textvariable=self.var_probes, width=14, justify="center").pack(side="right")
+        _ToolTip(lbl_probe, "Comma-separated positions along the pipe as percentages.\n"
+                 "Holdup and velocity time series are recorded at these locations.\n"
+                 "Default: 25, 50, 75.")
 
         # Trace all scalar vars for undo
         self.var_D.trace_add("write", self._on_scalar_var_write)
@@ -542,7 +612,20 @@ class SlugCapturingApp:
         self.canvas_pres.get_tk_widget().pack(fill="both", expand=True)
         self.notebook.add(tab5, text="Pressure Profile")
 
-        # Tab 6: Slug Statistics
+        # Tab 6: Residuals (convergence monitoring)
+        self.fig_resid = Figure(figsize=(8, 4), dpi=100)
+        self.ax_resid = self.fig_resid.add_subplot(111)
+        self.ax_resid.set_xlabel("Time (s)")
+        self.ax_resid.set_ylabel("Residual (max |d/dt|)")
+        self.ax_resid.set_title("Convergence Residuals")
+        self.ax_resid.set_yscale("log")
+        self.fig_resid.tight_layout()
+        tab_resid = ttk.Frame(self.notebook)
+        self.canvas_resid = FigureCanvasTkAgg(self.fig_resid, tab_resid)
+        self.canvas_resid.get_tk_widget().pack(fill="both", expand=True)
+        self.notebook.add(tab_resid, text="Residuals")
+
+        # Tab 7: Slug Statistics
         tab6 = ttk.Frame(self.notebook)
         self.notebook.add(tab6, text="Slug Statistics")
         self.stats_text = tk.Text(tab6, font=("Courier", 11), wrap="word",
@@ -613,23 +696,25 @@ class SlugCapturingApp:
             "N_cells": self.num_vars["N_cells"].get(),
             "CFL": self.num_vars["CFL"].get(),
             "t_end": self.num_vars["t_end"].get(),
+            "convergence_tol": self.num_vars["convergence_tol"].get(),
             "probe_pcts": self.var_probes.get(),
         }
 
     def _load_state(self, state, push_undo=True):
         self._suppress_undo = True
-        self.segment_table.set_segments(state.get("segments", DEFAULT_STATE["segments"]))
-        self.var_D.set(str(state.get("D", DEFAULT_STATE["D"])))
-        self.fluid_vars["rho_L"].set(str(state.get("rho_L", DEFAULT_STATE["rho_L"])))
-        self.fluid_vars["rho_G"].set(str(state.get("rho_G", DEFAULT_STATE["rho_G"])))
-        self.fluid_vars["mu_L"].set(str(state.get("mu_L", DEFAULT_STATE["mu_L"])))
-        self.fluid_vars["mu_G"].set(str(state.get("mu_G", DEFAULT_STATE["mu_G"])))
-        self.flow_vars["U_sL"].set(str(state.get("U_sL", DEFAULT_STATE["U_sL"])))
-        self.flow_vars["U_sG"].set(str(state.get("U_sG", DEFAULT_STATE["U_sG"])))
-        self.num_vars["N_cells"].set(str(state.get("N_cells", DEFAULT_STATE["N_cells"])))
-        self.num_vars["CFL"].set(str(state.get("CFL", DEFAULT_STATE["CFL"])))
-        self.num_vars["t_end"].set(str(state.get("t_end", DEFAULT_STATE["t_end"])))
-        self.var_probes.set(str(state.get("probe_pcts", DEFAULT_STATE["probe_pcts"])))
+        self.segment_table.set_segments(state["segments"])
+        self.var_D.set(str(state["D"]))
+        self.fluid_vars["rho_L"].set(str(state["rho_L"]))
+        self.fluid_vars["rho_G"].set(str(state["rho_G"]))
+        self.fluid_vars["mu_L"].set(str(state["mu_L"]))
+        self.fluid_vars["mu_G"].set(str(state["mu_G"]))
+        self.flow_vars["U_sL"].set(str(state["U_sL"]))
+        self.flow_vars["U_sG"].set(str(state["U_sG"]))
+        self.num_vars["N_cells"].set(str(state["N_cells"]))
+        self.num_vars["CFL"].set(str(state["CFL"]))
+        self.num_vars["t_end"].set(str(state["t_end"]))
+        self.num_vars["convergence_tol"].set(str(state["convergence_tol"]))
+        self.var_probes.set(str(state["probe_pcts"]))
         self._suppress_undo = False
 
     # ========================================================== undo / redo
@@ -794,6 +879,7 @@ class SlugCapturingApp:
             N_cells=int(self.num_vars["N_cells"].get()),
             CFL=float(self.num_vars["CFL"].get()),
             t_end=float(self.num_vars["t_end"].get()),
+            convergence_tol=float(self.num_vars["convergence_tol"].get()),
         )
 
     # ===================================== spatial plot helpers (reusable)
@@ -912,6 +998,37 @@ class SlugCapturingApp:
         self.ax_vel_probes.grid(True, alpha=0.3)
         self.fig_vel_probes.tight_layout()
         self.canvas_vel_probes.draw()
+
+    def _draw_residuals(self):
+        """Draw convergence residuals vs time on log scale."""
+        sim = self.sim
+        rh = sim.residual_history
+        if len(rh["time"]) < 2:
+            return
+        self.ax_resid.clear()
+        self.ax_resid.plot(rh["time"], rh["alpha"], "b-", linewidth=0.8,
+                           label=r"$\alpha_L$")
+        self.ax_resid.plot(rh["time"], rh["u_L"], "g-", linewidth=0.8,
+                           label=r"$u_L$")
+        self.ax_resid.plot(rh["time"], rh["u_G"], "r-", linewidth=0.8,
+                           label=r"$u_G$")
+        # Draw convergence tolerance line
+        conv_tol = sim.params.convergence_tol
+        if conv_tol > 0:
+            self.ax_resid.axhline(y=conv_tol, color="k", linestyle="--",
+                                  alpha=0.6, linewidth=1.0,
+                                  label=f"Tolerance ({conv_tol:.0e})")
+        self.ax_resid.set_xlabel("Time (s)")
+        self.ax_resid.set_ylabel("Residual (max |d/dt|)")
+        title = "Convergence Residuals"
+        if sim.converged:
+            title += " - CONVERGED"
+        self.ax_resid.set_title(title)
+        self.ax_resid.set_yscale("log")
+        self.ax_resid.legend(fontsize=8)
+        self.ax_resid.grid(True, alpha=0.3, which="both")
+        self.fig_resid.tight_layout()
+        self.canvas_resid.draw()
 
     def _draw_elevation(self, segments):
         self.ax_elev.clear()
@@ -1061,7 +1178,7 @@ class SlugCapturingApp:
         self.status_var.set("Running simulation...")
         self.progress_var.set(0)
 
-        for ax in [self.ax_holdup, self.ax_probes, self.ax_vel_probes, self.ax_vel, self.ax_pres]:
+        for ax in [self.ax_holdup, self.ax_probes, self.ax_vel_probes, self.ax_vel, self.ax_pres, self.ax_resid]:
             ax.clear()
 
         self.sim.run(
@@ -1085,9 +1202,10 @@ class SlugCapturingApp:
 
         # Progress bar
         self.progress_var.set(sim.progress * 100)
+        max_res = max(sim.residual_alpha, sim.residual_uL, sim.residual_uG)
         self.status_var.set(
             f"t = {sim.t:.3f} s | step {sim.step_count} | "
-            f"dt = {sim.dt:.2e} s | {sim.progress * 100:.1f}%"
+            f"dt = {sim.dt:.2e} s | res = {max_res:.2e} | {sim.progress * 100:.1f}%"
         )
 
         # Spatial plots from live data
@@ -1098,6 +1216,9 @@ class SlugCapturingApp:
         # Probe time series
         self._draw_probe_holdup()
         self._draw_probe_velocity()
+
+        # Residuals plot
+        self._draw_residuals()
 
         # Keep slider tracking latest snapshot
         if sim.snapshots:
@@ -1117,9 +1238,15 @@ class SlugCapturingApp:
         self.progress_var.set(100)
 
         if self.sim:
-            self.status_var.set(
-                f"Completed: t = {self.sim.t:.3f} s, {self.sim.step_count} steps"
-            )
+            if self.sim.converged:
+                self.status_var.set(
+                    f"Converged at t = {self.sim.t:.3f} s, {self.sim.step_count} steps "
+                    f"(tol = {self.sim.params.convergence_tol:.0e})"
+                )
+            else:
+                self.status_var.set(
+                    f"Completed: t = {self.sim.t:.3f} s, {self.sim.step_count} steps"
+                )
             self._update_plots()
             self._update_statistics()
 
@@ -1175,6 +1302,15 @@ class SlugCapturingApp:
         lines.append(f"  Total steps:       {sim.step_count}")
         lines.append(f"  Final dt:          {sim.dt:.2e} s")
         lines.append(f"  Snapshots stored:  {len(sim.snapshots)}")
+        lines.append(f"  Convergence tol:   {p.convergence_tol:.0e}")
+        if sim.converged:
+            lines.append(f"  Status:            CONVERGED (steady state reached)")
+        else:
+            lines.append(f"  Status:            Completed (t_end reached)")
+        lines.append(f"  Final residuals:")
+        lines.append(f"    alpha_L:  {sim.residual_alpha:.2e}")
+        lines.append(f"    u_L:      {sim.residual_uL:.2e}")
+        lines.append(f"    u_G:      {sim.residual_uG:.2e}")
         lines.append("")
 
         stats = sim.get_slug_statistics()
