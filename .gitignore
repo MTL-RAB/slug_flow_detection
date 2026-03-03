@@ -1,3 +1,19 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# RSA keys (never commit)
+keys/
+
+# License files
+*.lic
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+
+# OS artifacts
+*.exe
+Thumbs.db
+.DS_Store

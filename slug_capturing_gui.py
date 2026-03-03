@@ -22,6 +22,7 @@ Features:
 
 import json
 import os
+import sys
 import copy
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -33,6 +34,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from slug_capturing_solver import SimulationParameters, SlugCapturingSimulation
+from version import __app_name__, __version__, __build_date__, __author__
+import license_manager
 
 # Default file extension for project files
 PROJECT_EXT = ".scproj"
@@ -291,12 +294,12 @@ class SegmentTable(ttk.Frame):
 class SlugCapturingApp:
     """Main application window."""
 
-    def __init__(self, root):
+    def __init__(self, root, license_info=None):
         self.root = root
-        self.root.title("1D Slug Capturing Model \u2014 Issa & Kempf (2003)")
         self.root.geometry("1280x800")
 
         self.sim = None
+        self._license_info = license_info
 
         # File state
         self._project_path = None
@@ -342,6 +345,10 @@ class SlugCapturingApp:
         edit_menu.add_command(label="Undo             Ctrl+Z", command=self.edit_undo, state="disabled")
         edit_menu.add_command(label="Redo             Ctrl+Y", command=self.edit_redo, state="disabled")
         menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About...", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
 
         self.root.config(menu=menubar)
 
@@ -660,7 +667,12 @@ class SlugCapturingApp:
     def _update_title(self):
         name = os.path.basename(self._project_path) if self._project_path else "Untitled"
         marker = " *" if self._dirty else ""
-        self.root.title(f"{name}{marker} \u2014 1D Slug Capturing Model")
+        title = f"{name}{marker} \u2014 {__app_name__} v{__version__}"
+        if self._license_info:
+            org = self._license_info.get("organization", "")
+            if org:
+                title += f" \u2014 Licensed to: {org}"
+        self.root.title(title)
 
     def _confirm_discard(self):
         if not self._dirty:
@@ -730,6 +742,26 @@ class SlugCapturingApp:
             if self.sim and self.sim.is_running:
                 self.sim.stop()
             self.root.destroy()
+
+    def _show_about(self):
+        lines = [
+            f"{__app_name__}",
+            f"Version {__version__}  (built {__build_date__})",
+            f"Author: {__author__}",
+            "",
+            "1D Slug Capturing Two-Fluid Model",
+            "Issa & Kempf (2003), Int. J. Multiphase Flow, 29, 69-95.",
+        ]
+        if self._license_info:
+            lines.append("")
+            lines.append(f"Licensed to: {self._license_info.get('licensee', 'N/A')}")
+            lines.append(f"Organization: {self._license_info.get('organization', 'N/A')}")
+            lines.append(f"License type: {self._license_info.get('license_type', 'N/A')}")
+            lines.append(f"Expires: {self._license_info.get('expiry_date', 'N/A')}")
+        else:
+            lines.append("")
+            lines.append("(Development mode \u2014 no license)")
+        messagebox.showinfo("About", "\n".join(lines))
 
     # ======================================================= probe parsing
     def _parse_probe_positions(self):
@@ -1172,9 +1204,74 @@ class SlugCapturingApp:
 # ENTRY POINT
 # ============================================================================
 
+def _check_license(root):
+    """
+    Validate the license at startup (only when running as compiled .exe).
+
+    Returns license_info dict if valid, or None to abort.
+    """
+    # 1. Load the public key (embedded in the .exe bundle)
+    pub_path = license_manager.get_public_key_path()
+    if not os.path.isfile(pub_path):
+        messagebox.showerror("License Error",
+                             "Public key not found.\nThe application cannot verify licenses.",
+                             parent=root)
+        return None
+
+    try:
+        pub_key = license_manager.load_public_key(pub_path)
+    except Exception as exc:
+        messagebox.showerror("License Error", f"Could not load public key:\n{exc}", parent=root)
+        return None
+
+    # 2. Look for license.lic in standard locations
+    lic_path = license_manager.find_license_file()
+
+    if lic_path is None:
+        # Ask user to browse for it
+        messagebox.showinfo("License Required",
+                            f"{__app_name__} requires a valid license file.\n\n"
+                            "Please locate your license.lic file.",
+                            parent=root)
+        lic_path = filedialog.askopenfilename(
+            title="Select License File",
+            filetypes=[("License files", "*.lic"), ("All files", "*.*")],
+            parent=root,
+        )
+        if not lic_path:
+            return None
+
+    # 3. Load and validate
+    try:
+        lic_data = license_manager.load_license(lic_path)
+    except Exception as exc:
+        messagebox.showerror("License Error",
+                             f"Could not read license file:\n{exc}", parent=root)
+        return None
+
+    valid, msg = license_manager.validate_license(pub_key, lic_data, __version__)
+    if not valid:
+        messagebox.showerror("License Invalid", msg, parent=root)
+        return None
+
+    return lic_data
+
+
 def main():
     root = tk.Tk()
-    app = SlugCapturingApp(root)
+    root.withdraw()  # hide while checking license
+
+    license_info = None
+    if getattr(sys, "frozen", False):
+        # Compiled mode — require valid license
+        license_info = _check_license(root)
+        if license_info is None:
+            root.destroy()
+            return
+    # Development mode — no license required
+
+    root.deiconify()
+    app = SlugCapturingApp(root, license_info=license_info)
     root.mainloop()
 
 
