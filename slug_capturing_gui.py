@@ -11,17 +11,19 @@ and run a 1D slug capturing simulation based on:
 Usage:
     python slug_capturing_gui.py
 
-The pipeline is defined segment-by-segment. Each segment has:
-    - Length (m)
-    - Inclination angle (degrees from horizontal)
-      Positive = uphill, negative = downhill
-      +90 = vertical riser, -90 = vertical downcomer
+Features:
+    - Segment-based pipeline geometry (any angle -90 to +90 deg)
+    - File > New / Open / Save / Save As  (JSON project files)
+    - Edit > Undo / Redo  (full parameter-state snapshots)
+    - Keyboard shortcuts: Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+Z, Ctrl+Y
 """
 
+import json
+import os
+import copy
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import numpy as np
-import threading
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -29,6 +31,108 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 from slug_capturing_solver import SimulationParameters, SlugCapturingSimulation
+
+# Default file extension for project files
+PROJECT_EXT = ".scproj"
+PROJECT_FILETYPES = [("Slug Capturing Project", f"*{PROJECT_EXT}"), ("All Files", "*.*")]
+
+# ============================================================================
+# PROJECT STATE  — serializable snapshot of every input parameter
+# ============================================================================
+
+# Canonical defaults (Issa & Kempf 2003 air-water test case)
+DEFAULT_STATE = {
+    "segments": [{"length": 36.0, "angle": 0.0}],
+    "D": 0.078,
+    "rho_L": 998.0,
+    "rho_G": 1.2,
+    "mu_L": 0.001,
+    "mu_G": 1.8e-5,
+    "U_sL": 1.0,
+    "U_sG": 3.0,
+    "N_cells": 500,
+    "CFL": 0.45,
+    "t_end": 30.0,
+}
+
+
+def _deep_copy_state(state):
+    """Deep-copy a state dict (segments list contains dicts)."""
+    return copy.deepcopy(state)
+
+
+# ============================================================================
+# UNDO / REDO MANAGER
+# ============================================================================
+
+class UndoManager:
+    """
+    Manages undo and redo stacks of full parameter-state snapshots.
+
+    Every user edit pushes a new snapshot onto the undo stack and clears
+    the redo stack.  Undo pops the current state onto redo and restores
+    the previous.  Redo reverses that.
+    """
+
+    MAX_UNDO = 100  # keep memory bounded
+
+    def __init__(self):
+        self._undo_stack = []   # list of state dicts, most-recent last
+        self._redo_stack = []
+        self._on_change = None  # optional callback(can_undo, can_redo)
+
+    def set_change_callback(self, cb):
+        """Register callback(can_undo: bool, can_redo: bool)."""
+        self._on_change = cb
+
+    def push(self, state):
+        """Record a new state (after the user edits something)."""
+        self._undo_stack.append(_deep_copy_state(state))
+        if len(self._undo_stack) > self.MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._notify()
+
+    def undo(self, current_state):
+        """
+        Undo: move current state to redo stack, return previous state.
+        Returns None if nothing to undo.
+        """
+        if not self._undo_stack:
+            return None
+        self._redo_stack.append(_deep_copy_state(current_state))
+        restored = self._undo_stack.pop()
+        self._notify()
+        return restored
+
+    def redo(self, current_state):
+        """
+        Redo: move current state to undo stack, return next state.
+        Returns None if nothing to redo.
+        """
+        if not self._redo_stack:
+            return None
+        self._undo_stack.append(_deep_copy_state(current_state))
+        restored = self._redo_stack.pop()
+        self._notify()
+        return restored
+
+    def clear(self):
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._notify()
+
+    @property
+    def can_undo(self):
+        return len(self._undo_stack) > 0
+
+    @property
+    def can_redo(self):
+        return len(self._redo_stack) > 0
+
+    def _notify(self):
+        if self._on_change:
+            self._on_change(self.can_undo, self.can_redo)
 
 
 # ============================================================================
@@ -41,9 +145,11 @@ class SegmentTable(ttk.Frame):
     Each row: [Segment #] [Length (m)] [Angle (deg)] [Delete button]
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent, on_change=None):
         super().__init__(parent)
         self.rows = []  # list of (length_var, angle_var, frame)
+        self._on_change = on_change  # called after any edit
+        self._suppress_trace = False  # prevent recursive trace calls
 
         # Header
         hdr = ttk.Frame(self)
@@ -59,17 +165,17 @@ class SegmentTable(ttk.Frame):
         # Buttons
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", pady=(4, 0))
-        ttk.Button(btn_frame, text="+ Add Segment", command=self.add_row).pack(side="left")
-        ttk.Button(btn_frame, text="Reset to Default", command=self.reset_default).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="+ Add Segment", command=self._user_add_row).pack(side="left")
+        ttk.Button(btn_frame, text="Reset to Default", command=self._user_reset).pack(side="left", padx=4)
 
         # Pipeline preview canvas
         self.preview_canvas = tk.Canvas(self, height=80, bg="white", relief="sunken", bd=1)
         self.preview_canvas.pack(fill="x", pady=(6, 0))
 
-        self.reset_default()
+    # --- public API (no undo push) ---
 
     def add_row(self, length="10.0", angle="0.0"):
-        """Add a new segment row."""
+        """Add a new segment row (programmatic — no undo push)."""
         idx = len(self.rows)
         row_frame = ttk.Frame(self.table_frame)
         row_frame.pack(fill="x", pady=1)
@@ -79,58 +185,41 @@ class SegmentTable(ttk.Frame):
         length_var = tk.StringVar(value=length)
         angle_var = tk.StringVar(value=angle)
 
-        e_len = ttk.Entry(row_frame, textvariable=length_var, width=12, justify="center")
-        e_len.pack(side="left", padx=2)
-        e_ang = ttk.Entry(row_frame, textvariable=angle_var, width=12, justify="center")
-        e_ang.pack(side="left", padx=2)
+        ttk.Entry(row_frame, textvariable=length_var, width=12, justify="center").pack(side="left", padx=2)
+        ttk.Entry(row_frame, textvariable=angle_var, width=12, justify="center").pack(side="left", padx=2)
 
         del_btn = ttk.Button(row_frame, text="\u2716", width=3,
-                             command=lambda: self.delete_row(row_frame))
+                             command=lambda f=row_frame: self._user_delete_row(f))
         del_btn.pack(side="left", padx=2)
 
         self.rows.append((length_var, angle_var, row_frame))
 
-        # Bind change events to update preview
-        length_var.trace_add("write", lambda *_: self.update_preview())
-        angle_var.trace_add("write", lambda *_: self.update_preview())
+        # Trace for live preview AND undo push on value edits
+        length_var.trace_add("write", self._on_var_write)
+        angle_var.trace_add("write", self._on_var_write)
         self.update_preview()
 
-    def delete_row(self, frame):
-        """Remove a segment row."""
-        for i, (l, a, f) in enumerate(self.rows):
-            if f is frame:
-                f.destroy()
-                self.rows.pop(i)
-                self._renumber()
-                self.update_preview()
-                return
-
-    def _renumber(self):
-        """Re-number segment labels after deletion."""
-        for i, (_, _, frame) in enumerate(self.rows):
-            children = frame.winfo_children()
-            if children:
-                children[0].config(text=str(i + 1))
-
-    def reset_default(self):
-        """Reset to single 36m horizontal segment (Issa & Kempf test case)."""
+    def clear_rows(self):
+        """Remove all rows (programmatic)."""
         for _, _, frame in self.rows:
             frame.destroy()
         self.rows.clear()
-        self.add_row("36.0", "0.0")
+
+    def set_segments(self, seg_list):
+        """Load segments from a list of {length, angle} dicts (programmatic)."""
+        self._suppress_trace = True
+        self.clear_rows()
+        for seg in seg_list:
+            self.add_row(str(seg["length"]), str(seg["angle"]))
+        self._suppress_trace = False
+        self.update_preview()
+
+    def reset_default(self):
+        """Reset to default segments (programmatic — no undo push)."""
+        self.set_segments(DEFAULT_STATE["segments"])
 
     def get_segments(self):
-        """
-        Parse and return segment list.
-
-        Returns
-        -------
-        list of (length_m, angle_deg) tuples
-
-        Raises
-        ------
-        ValueError if any input is invalid
-        """
+        """Parse and return segment list as (length, angle) tuples."""
         segments = []
         for i, (l_var, a_var, _) in enumerate(self.rows):
             try:
@@ -143,6 +232,47 @@ class SegmentTable(ttk.Frame):
                 raise ValueError(f"Segment {i + 1}: invalid angle '{a_var.get()}'")
             segments.append((length, angle))
         return segments
+
+    def get_segments_as_dicts(self):
+        """Return segments as list of dicts (for serialization)."""
+        return [{"length": l, "angle": a} for l, a in self.get_segments()]
+
+    # --- user actions (push undo) ---
+
+    def _user_add_row(self):
+        self.add_row()
+        self._fire_change()
+
+    def _user_reset(self):
+        self.reset_default()
+        self._fire_change()
+
+    def _user_delete_row(self, frame):
+        for i, (l, a, f) in enumerate(self.rows):
+            if f is frame:
+                f.destroy()
+                self.rows.pop(i)
+                self._renumber()
+                self.update_preview()
+                self._fire_change()
+                return
+
+    def _on_var_write(self, *_):
+        if not self._suppress_trace:
+            self.update_preview()
+            self._fire_change()
+
+    def _fire_change(self):
+        if self._on_change:
+            self._on_change()
+
+    def _renumber(self):
+        for i, (_, _, frame) in enumerate(self.rows):
+            children = frame.winfo_children()
+            if children:
+                children[0].config(text=str(i + 1))
+
+    # --- preview drawing ---
 
     def update_preview(self):
         """Draw a simple side-view sketch of the pipeline segments."""
@@ -157,7 +287,6 @@ class SegmentTable(ttk.Frame):
         if not segments:
             return
 
-        # Compute polyline in physical coordinates
         points = [(0.0, 0.0)]
         for length, angle_deg in segments:
             x0, y0 = points[-1]
@@ -166,7 +295,6 @@ class SegmentTable(ttk.Frame):
             y1 = y0 + length * np.sin(angle_rad)
             points.append((x1, y1))
 
-        # Scale to fit canvas
         w = c.winfo_width() or 300
         h = c.winfo_height() or 80
         margin = 20
@@ -179,7 +307,6 @@ class SegmentTable(ttk.Frame):
         y_range = max(y_max - y_min, 0.1)
 
         scale = min((w - 2 * margin) / x_range, (h - 2 * margin) / y_range)
-        # If pipeline is flat, use a fixed scale
         if y_range < 0.01 * x_range:
             scale = (w - 2 * margin) / x_range
 
@@ -188,7 +315,6 @@ class SegmentTable(ttk.Frame):
             cy = h / 2 - (py - (y_min + y_max) / 2) * scale
             return cx, cy
 
-        # Draw segments with color coding
         colors = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#F44336",
                   "#00BCD4", "#795548", "#607D8B"]
         for i, ((x0, y0), (x1, y1)) in enumerate(zip(points[:-1], points[1:])):
@@ -196,14 +322,12 @@ class SegmentTable(ttk.Frame):
             cx1, cy1 = to_canvas(x1, y1)
             color = colors[i % len(colors)]
             c.create_line(cx0, cy0, cx1, cy1, fill=color, width=4, capstyle="round")
-            # Label with angle
             mid_cx = (cx0 + cx1) / 2
             mid_cy = (cy0 + cy1) / 2 - 10
             angle = segments[i][1]
             c.create_text(mid_cx, mid_cy, text=f"{angle}\u00b0",
                           fill=color, font=("Arial", 8, "bold"))
 
-        # Flow direction arrow
         cx0, cy0 = to_canvas(*points[0])
         c.create_text(cx0, cy0 + 12, text="Inlet", fill="#666", font=("Arial", 7))
         cxN, cyN = to_canvas(*points[-1])
@@ -219,15 +343,65 @@ class SlugCapturingApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("1D Slug Capturing Model — Issa & Kempf (2003)")
+        self.root.title("1D Slug Capturing Model \u2014 Issa & Kempf (2003)")
         self.root.geometry("1280x800")
 
-        self.sim = None  # current simulation
+        self.sim = None
 
+        # File state
+        self._project_path = None   # None = untitled
+        self._dirty = False          # unsaved changes?
+
+        # Undo / redo
+        self._undo_mgr = UndoManager()
+        self._undo_mgr.set_change_callback(self._on_undo_state_change)
+        self._suppress_undo = False  # prevent undo push during load/undo/redo
+
+        self._build_menu()
         self._build_gui()
+        self._bind_shortcuts()
 
+        # Load defaults and push initial undo state
+        self._load_state(DEFAULT_STATE, push_undo=False)
+        self._undo_mgr.clear()
+        self._set_dirty(False)
+
+        # Prompt on window close if dirty
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ menu
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+
+        # File menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New              Ctrl+N", command=self.file_new)
+        file_menu.add_command(label="Open...          Ctrl+O", command=self.file_open)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save             Ctrl+S", command=self.file_save)
+        file_menu.add_command(label="Save As...       Ctrl+Shift+S", command=self.file_save_as)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        # Edit menu
+        self._edit_menu = edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Undo             Ctrl+Z", command=self.edit_undo, state="disabled")
+        edit_menu.add_command(label="Redo             Ctrl+Y", command=self.edit_redo, state="disabled")
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        self.root.config(menu=menubar)
+
+    def _bind_shortcuts(self):
+        self.root.bind("<Control-n>", lambda e: self.file_new())
+        self.root.bind("<Control-o>", lambda e: self.file_open())
+        self.root.bind("<Control-s>", lambda e: self.file_save())
+        self.root.bind("<Control-S>", lambda e: self.file_save_as())   # Ctrl+Shift+S
+        self.root.bind("<Control-z>", lambda e: self.edit_undo())
+        self.root.bind("<Control-y>", lambda e: self.edit_redo())
+
+    # ------------------------------------------------------------------ gui
     def _build_gui(self):
-        # Main horizontal paned window
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -235,7 +409,6 @@ class SlugCapturingApp:
         left = ttk.Frame(paned, width=370)
         paned.add(left, weight=0)
 
-        # Scrollable left panel
         left_canvas = tk.Canvas(left, width=350)
         left_scroll = ttk.Scrollbar(left, orient="vertical", command=left_canvas.yview)
         left_inner = ttk.Frame(left_canvas)
@@ -248,25 +421,23 @@ class SlugCapturingApp:
         left_canvas.pack(side="left", fill="both", expand=True)
         left_scroll.pack(side="right", fill="y")
 
-        # Title
         ttk.Label(left_inner, text="Pipeline & Fluid Parameters",
                   font=("Arial", 12, "bold")).pack(anchor="w", pady=(4, 8))
 
-        # --- Pipeline Geometry ---
+        # Pipeline Geometry
         geo_frame = ttk.LabelFrame(left_inner, text="Pipeline Segments", padding=6)
         geo_frame.pack(fill="x", padx=4, pady=2)
 
-        self.segment_table = SegmentTable(geo_frame)
+        self.segment_table = SegmentTable(geo_frame, on_change=self._on_param_change)
         self.segment_table.pack(fill="x")
 
-        # Pipe diameter
         diam_frame = ttk.Frame(geo_frame)
         diam_frame.pack(fill="x", pady=(6, 0))
         ttk.Label(diam_frame, text="Pipe diameter D (m):").pack(side="left")
         self.var_D = tk.StringVar(value="0.078")
         ttk.Entry(diam_frame, textvariable=self.var_D, width=10, justify="center").pack(side="right")
 
-        # --- Fluid Properties ---
+        # Fluid Properties
         fluid_frame = ttk.LabelFrame(left_inner, text="Fluid Properties", padding=6)
         fluid_frame.pack(fill="x", padx=4, pady=6)
 
@@ -285,7 +456,7 @@ class SlugCapturingApp:
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.fluid_vars[key] = var
 
-        # --- Flow Conditions ---
+        # Flow Conditions
         flow_frame = ttk.LabelFrame(left_inner, text="Flow Conditions", padding=6)
         flow_frame.pack(fill="x", padx=4, pady=2)
 
@@ -302,7 +473,7 @@ class SlugCapturingApp:
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.flow_vars[key] = var
 
-        # --- Numerical Settings ---
+        # Numerical Settings
         num_frame = ttk.LabelFrame(left_inner, text="Numerical Settings", padding=6)
         num_frame.pack(fill="x", padx=4, pady=6)
 
@@ -320,7 +491,16 @@ class SlugCapturingApp:
             ttk.Entry(row, textvariable=var, width=10, justify="center").pack(side="right")
             self.num_vars[key] = var
 
-        # --- Buttons ---
+        # Trace all scalar vars for undo
+        self.var_D.trace_add("write", self._on_scalar_var_write)
+        for v in self.fluid_vars.values():
+            v.trace_add("write", self._on_scalar_var_write)
+        for v in self.flow_vars.values():
+            v.trace_add("write", self._on_scalar_var_write)
+        for v in self.num_vars.values():
+            v.trace_add("write", self._on_scalar_var_write)
+
+        # Buttons
         btn_frame = ttk.Frame(left_inner)
         btn_frame.pack(fill="x", padx=4, pady=8)
 
@@ -332,7 +512,7 @@ class SlugCapturingApp:
                                    state="disabled")
         self.btn_stop.pack(fill="x", pady=2)
 
-        # --- Progress ---
+        # Progress
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(left_inner, variable=self.progress_var,
                                             maximum=100)
@@ -402,7 +582,6 @@ class SlugCapturingApp:
         # Tab 5: Slug Statistics
         tab5 = ttk.Frame(self.notebook)
         self.notebook.add(tab5, text="Slug Statistics")
-
         self.stats_text = tk.Text(tab5, font=("Courier", 11), wrap="word",
                                   state="disabled", bg="#f5f5f5")
         self.stats_text.pack(fill="both", expand=True, padx=8, pady=8)
@@ -419,8 +598,170 @@ class SlugCapturingApp:
         self.canvas_elev.get_tk_widget().pack(fill="both", expand=True)
         self.notebook.add(tab6, text="Pipeline Profile")
 
-    # --- Helpers ---
+    # ============================================================ state I/O
+    def _get_state(self):
+        """Capture current GUI fields as a state dict."""
+        try:
+            segs = self.segment_table.get_segments_as_dicts()
+        except ValueError:
+            segs = [{"length": 36.0, "angle": 0.0}]
+        return {
+            "segments": segs,
+            "D": self.var_D.get(),
+            "rho_L": self.fluid_vars["rho_L"].get(),
+            "rho_G": self.fluid_vars["rho_G"].get(),
+            "mu_L": self.fluid_vars["mu_L"].get(),
+            "mu_G": self.fluid_vars["mu_G"].get(),
+            "U_sL": self.flow_vars["U_sL"].get(),
+            "U_sG": self.flow_vars["U_sG"].get(),
+            "N_cells": self.num_vars["N_cells"].get(),
+            "CFL": self.num_vars["CFL"].get(),
+            "t_end": self.num_vars["t_end"].get(),
+        }
 
+    def _load_state(self, state, push_undo=True):
+        """Apply a state dict to all GUI fields."""
+        self._suppress_undo = True
+
+        self.segment_table.set_segments(state.get("segments", DEFAULT_STATE["segments"]))
+        self.var_D.set(str(state.get("D", DEFAULT_STATE["D"])))
+        self.fluid_vars["rho_L"].set(str(state.get("rho_L", DEFAULT_STATE["rho_L"])))
+        self.fluid_vars["rho_G"].set(str(state.get("rho_G", DEFAULT_STATE["rho_G"])))
+        self.fluid_vars["mu_L"].set(str(state.get("mu_L", DEFAULT_STATE["mu_L"])))
+        self.fluid_vars["mu_G"].set(str(state.get("mu_G", DEFAULT_STATE["mu_G"])))
+        self.flow_vars["U_sL"].set(str(state.get("U_sL", DEFAULT_STATE["U_sL"])))
+        self.flow_vars["U_sG"].set(str(state.get("U_sG", DEFAULT_STATE["U_sG"])))
+        self.num_vars["N_cells"].set(str(state.get("N_cells", DEFAULT_STATE["N_cells"])))
+        self.num_vars["CFL"].set(str(state.get("CFL", DEFAULT_STATE["CFL"])))
+        self.num_vars["t_end"].set(str(state.get("t_end", DEFAULT_STATE["t_end"])))
+
+        self._suppress_undo = False
+
+    # ========================================================== undo / redo
+    def _on_scalar_var_write(self, *_):
+        """Called when any scalar input variable changes."""
+        if not self._suppress_undo:
+            self._on_param_change()
+
+    def _on_param_change(self):
+        """Push current state for undo and mark dirty."""
+        if self._suppress_undo:
+            return
+        self._undo_mgr.push(self._get_state())
+        self._set_dirty(True)
+
+    def _on_undo_state_change(self, can_undo, can_redo):
+        """Update Edit menu item states."""
+        self._edit_menu.entryconfig(0, state="normal" if can_undo else "disabled")
+        self._edit_menu.entryconfig(1, state="normal" if can_redo else "disabled")
+
+    def edit_undo(self):
+        restored = self._undo_mgr.undo(self._get_state())
+        if restored:
+            self._load_state(restored, push_undo=False)
+            self._set_dirty(True)
+
+    def edit_redo(self):
+        restored = self._undo_mgr.redo(self._get_state())
+        if restored:
+            self._load_state(restored, push_undo=False)
+            self._set_dirty(True)
+
+    # ============================================================ file ops
+    def _set_dirty(self, dirty):
+        self._dirty = dirty
+        self._update_title()
+
+    def _update_title(self):
+        name = os.path.basename(self._project_path) if self._project_path else "Untitled"
+        marker = " *" if self._dirty else ""
+        self.root.title(f"{name}{marker} \u2014 1D Slug Capturing Model")
+
+    def _confirm_discard(self):
+        """If there are unsaved changes, ask the user. Returns True if OK to proceed."""
+        if not self._dirty:
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            "You have unsaved changes. Save before continuing?",
+        )
+        if answer is None:       # Cancel
+            return False
+        if answer:               # Yes → save first
+            self.file_save()
+            return not self._dirty   # still dirty if save was cancelled
+        return True              # No → discard
+
+    def file_new(self):
+        """File > New: reset to defaults."""
+        if not self._confirm_discard():
+            return
+        self._project_path = None
+        self._undo_mgr.clear()
+        self._load_state(DEFAULT_STATE, push_undo=False)
+        self._set_dirty(False)
+
+    def file_open(self):
+        """File > Open: load a .scproj JSON file."""
+        if not self._confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            title="Open Project",
+            filetypes=PROJECT_FILETYPES,
+            defaultextension=PROJECT_EXT,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Open Failed", f"Could not read file:\n{exc}")
+            return
+
+        self._project_path = path
+        self._undo_mgr.clear()
+        self._load_state(state, push_undo=False)
+        self._set_dirty(False)
+
+    def file_save(self):
+        """File > Save: save to current path, or Save As if untitled."""
+        if self._project_path is None:
+            self.file_save_as()
+            return
+        self._write_project(self._project_path)
+
+    def file_save_as(self):
+        """File > Save As: choose a new path and save."""
+        path = filedialog.asksaveasfilename(
+            title="Save Project As",
+            filetypes=PROJECT_FILETYPES,
+            defaultextension=PROJECT_EXT,
+        )
+        if not path:
+            return
+        self._project_path = path
+        self._write_project(path)
+
+    def _write_project(self, path):
+        """Write current state to a JSON file."""
+        state = self._get_state()
+        try:
+            with open(path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Save Failed", f"Could not write file:\n{exc}")
+            return
+        self._set_dirty(False)
+
+    def _on_close(self):
+        """Window close handler — prompt if dirty."""
+        if self._confirm_discard():
+            if self.sim and self.sim.is_running:
+                self.sim.stop()
+            self.root.destroy()
+
+    # ============================================================ sim params
     def _get_params(self):
         """Parse all GUI inputs into a SimulationParameters object."""
         segments = self.segment_table.get_segments()
@@ -439,7 +780,6 @@ class SlugCapturingApp:
         )
 
     def _draw_elevation(self, segments):
-        """Draw the pipeline elevation profile on the elevation tab."""
         self.ax_elev.clear()
         self.ax_elev.set_xlabel("Horizontal distance (m)")
         self.ax_elev.set_ylabel("Elevation (m)")
@@ -465,34 +805,27 @@ class SlugCapturingApp:
         self.fig_elev.tight_layout()
         self.canvas_elev.draw()
 
-    # --- Simulation Control ---
-
+    # ============================================================ simulation
     def run_simulation(self):
-        """Parse inputs, initialize simulation, and start running."""
         try:
             params = self._get_params()
         except (ValueError, Exception) as e:
             messagebox.showerror("Input Error", str(e))
             return
 
-        # Draw elevation profile
         self._draw_elevation(params.segments)
 
-        # Create and initialize simulation
         self.sim = SlugCapturingSimulation(params)
         self.sim.initialize()
 
-        # Update UI state
         self.btn_run.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.status_var.set("Running simulation...")
         self.progress_var.set(0)
 
-        # Clear previous plots
         for ax in [self.ax_holdup, self.ax_probes, self.ax_vel, self.ax_pres]:
             ax.clear()
 
-        # Start simulation
         self.sim.run(
             on_step=lambda sim: self.root.after(0, self._update_plots),
             on_done=lambda sim: self.root.after(0, self._on_simulation_done),
@@ -500,27 +833,24 @@ class SlugCapturingApp:
         )
 
     def stop_simulation(self):
-        """Stop a running simulation."""
         if self.sim and self.sim.is_running:
             self.sim.stop()
             self.status_var.set("Simulation stopped by user")
 
     def _update_plots(self):
-        """Update all plots with current simulation state (called from main thread)."""
         sim = self.sim
         if sim is None:
             return
 
         x = sim.mesh["x_cell"]
 
-        # Progress
         self.progress_var.set(sim.progress * 100)
         self.status_var.set(
             f"t = {sim.t:.3f} s | step {sim.step_count} | "
             f"dt = {sim.dt:.2e} s | {sim.progress * 100:.1f}%"
         )
 
-        # Tab 1: Holdup profile
+        # Holdup profile
         self.ax_holdup.clear()
         self.ax_holdup.plot(x, sim.alpha_L, "b-", linewidth=0.8)
         self.ax_holdup.set_xlabel("Position along pipe (m)")
@@ -529,7 +859,6 @@ class SlugCapturingApp:
         self.ax_holdup.set_title(f"Liquid Holdup Profile at t = {sim.t:.2f} s")
         self.ax_holdup.axhline(y=0.85, color="r", linestyle="--", alpha=0.4,
                                label="Slug threshold")
-        # Mark segment boundaries
         for b in sim.mesh["seg_boundaries"][1:-1]:
             self.ax_holdup.axvline(x=x[min(b, len(x) - 1)], color="gray",
                                   linestyle=":", alpha=0.5)
@@ -538,7 +867,7 @@ class SlugCapturingApp:
         self.fig_holdup.tight_layout()
         self.canvas_holdup.draw()
 
-        # Tab 2: Probe time series
+        # Probe time series
         probes = sim.probes
         if len(probes.time) > 1:
             self.ax_probes.clear()
@@ -556,7 +885,7 @@ class SlugCapturingApp:
             self.fig_probes.tight_layout()
             self.canvas_probes.draw()
 
-        # Tab 3: Velocity profiles
+        # Velocity profiles
         self.ax_vel.clear()
         self.ax_vel.plot(x, sim.u_L, "b-", linewidth=0.8, label="Liquid u\u2097")
         self.ax_vel.plot(x, sim.u_G, "r-", linewidth=0.8, label="Gas u\u1d33")
@@ -569,7 +898,6 @@ class SlugCapturingApp:
         self.canvas_vel.draw()
 
     def _on_simulation_done(self):
-        """Called when simulation finishes."""
         self.btn_run.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.progress_var.set(100)
@@ -583,7 +911,6 @@ class SlugCapturingApp:
             self._update_pressure()
 
     def _update_statistics(self):
-        """Update the slug statistics tab."""
         self.stats_text.config(state="normal")
         self.stats_text.delete("1.0", "end")
 
@@ -598,7 +925,6 @@ class SlugCapturingApp:
         lines.append("=" * 60)
         lines.append("")
 
-        # Input summary
         p = sim.params
         lines.append("INPUT PARAMETERS:")
         lines.append(f"  Pipe diameter:     {p.D:.4f} m")
@@ -618,14 +944,12 @@ class SlugCapturingApp:
         lines.append(f"  Simulation time:   {p.t_end:.1f} s")
         lines.append("")
 
-        # Simulation summary
         lines.append("SIMULATION SUMMARY:")
         lines.append(f"  Final time:        {sim.t:.3f} s")
         lines.append(f"  Total steps:       {sim.step_count}")
         lines.append(f"  Final dt:          {sim.dt:.2e} s")
         lines.append("")
 
-        # Slug statistics
         stats = sim.get_slug_statistics()
         lines.append("SLUG STATISTICS:")
         if stats:
@@ -638,7 +962,6 @@ class SlugCapturingApp:
             lines.append("  Try increasing simulation time or adjusting flow rates.")
         lines.append("")
 
-        # Mixture velocity for reference
         U_m = p.U_sL + p.U_sG
         lines.append("REFERENCE VALUES:")
         lines.append(f"  Mixture velocity U_m = U_sL + U_sG = {U_m:.2f} m/s")
@@ -650,7 +973,6 @@ class SlugCapturingApp:
         self.stats_text.config(state="disabled")
 
     def _update_pressure(self):
-        """Estimate and plot pressure profile from gas momentum balance."""
         sim = self.sim
         if sim is None:
             return
@@ -660,8 +982,6 @@ class SlugCapturingApp:
         beta = sim.mesh["beta"]
         N = len(x)
 
-        # Estimate pressure gradient from gas momentum source terms:
-        # dp/dx ~ -rho_G * g * sin(beta) - (tau_wG * S_G + tau_i * S_i) / (alpha_G * A)
         from slug_capturing_equations import compute_all_geometry, compute_all_shear
 
         geom = compute_all_geometry(sim.alpha_L, sim.params.D)
@@ -681,7 +1001,6 @@ class SlugCapturingApp:
             / (alpha_G * A_pipe)
         )
 
-        # Integrate from outlet (p=0) backwards
         p = np.zeros(N)
         for i in range(N - 2, -1, -1):
             p[i] = p[i + 1] - dp_dx[i] * dx[i]
