@@ -875,7 +875,8 @@ def equilibrium_holdup(U_sL, U_sG, D, rho_L, rho_G, mu_L, mu_G, beta_rad):
     This is the initial condition: the holdup where the gas and liquid
     momentum equations are in balance for the given superficial velocities.
 
-    Solved iteratively.
+    Uses a coarse scan to locate sign changes in the momentum residual,
+    then refines with bisection for accuracy.
 
     Parameters
     ----------
@@ -892,43 +893,56 @@ def equilibrium_holdup(U_sL, U_sG, D, rho_L, rho_G, mu_L, mu_G, beta_rad):
     -------
     alpha_L_eq : float — equilibrium liquid holdup (dimensionless)
     """
-    A_pipe = np.pi * D ** 2 / 4.0
 
-    best_alpha = 0.5
-    best_residual = 1e30
-
-    for alpha_L_try in np.linspace(0.02, 0.98, 500):
-        alpha_G_try = 1.0 - alpha_L_try
-
+    def _residual(alpha_L_try):
         u_L = U_sL / alpha_L_try
-        u_G = U_sG / alpha_G_try
-
+        u_G = U_sG / (1.0 - alpha_L_try)
         geom = compute_all_geometry(alpha_L_try, D)
         A_L = max(geom["A_L"], 1e-12)
         A_G = max(geom["A_G"], 1e-12)
-        S_L = geom["S_L"]
-        S_G = geom["S_G"]
-        S_i = geom["S_i"]
-        D_hL = geom["D_hL"]
-        D_hG = geom["D_hG"]
-
-        shear = compute_all_shear(u_L, u_G, rho_L, rho_G, mu_L, mu_G, D_hL, D_hG)
-        tau_wL = shear["tau_wL"]
-        tau_wG = shear["tau_wG"]
-        tau_i = shear["tau_i"]
-
-        # Combined momentum balance residual (should be zero at equilibrium):
-        # tau_wL*S_L/A_L - tau_wG*S_G/A_G - tau_i*S_i*(1/A_L + 1/A_G)
-        # + (rho_L - rho_G)*g*sin(beta) = 0
-        residual = (
-            tau_wL * S_L / A_L
-            - tau_wG * S_G / A_G
-            - tau_i * S_i * (1.0 / A_L + 1.0 / A_G)
+        shear = compute_all_shear(u_L, u_G, rho_L, rho_G, mu_L, mu_G,
+                                  geom["D_hL"], geom["D_hG"])
+        return (
+            shear["tau_wL"] * geom["S_L"] / A_L
+            - shear["tau_wG"] * geom["S_G"] / A_G
+            - shear["tau_i"] * geom["S_i"] * (1.0 / A_L + 1.0 / A_G)
             + (rho_L - rho_G) * GRAVITY * np.sin(beta_rad)
         )
 
-        if abs(residual) < abs(best_residual):
-            best_residual = residual
-            best_alpha = alpha_L_try
+    # --- Stage 1: coarse scan to find sign changes -----------------------
+    alphas = np.linspace(0.02, 0.98, 500)
+    residuals = np.array([_residual(a) for a in alphas])
+
+    # Look for sign changes (robust root detection)
+    sign_changes = []
+    for i in range(len(residuals) - 1):
+        if residuals[i] * residuals[i + 1] < 0:
+            sign_changes.append(i)
+
+    # --- Stage 2: bisection refinement at each sign change ----------------
+    best_alpha = 0.5
+    best_abs_res = 1e30
+
+    for idx in sign_changes:
+        a_lo, a_hi = alphas[idx], alphas[idx + 1]
+        r_lo = residuals[idx]
+        for _ in range(50):  # bisection iterations
+            a_mid = 0.5 * (a_lo + a_hi)
+            r_mid = _residual(a_mid)
+            if r_lo * r_mid <= 0:
+                a_hi = a_mid
+            else:
+                a_lo = a_mid
+                r_lo = r_mid
+        a_mid = 0.5 * (a_lo + a_hi)
+        r_mid = _residual(a_mid)
+        if abs(r_mid) < best_abs_res:
+            best_abs_res = abs(r_mid)
+            best_alpha = a_mid
+
+    # --- Fallback: if no sign change found, use minimum |residual| --------
+    if not sign_changes:
+        idx_min = np.argmin(np.abs(residuals))
+        best_alpha = alphas[idx_min]
 
     return best_alpha
